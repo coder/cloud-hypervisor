@@ -474,7 +474,14 @@ impl EndpointHandler for VmAddDisk {
                         match vm_add_disk(api_notifier, api_sender, Arc::new(vm_add_disk_data))
                             .map_err(HttpError::VmAddDisk)
                         {
-                            Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
+                            Ok(add_disk_info) => {
+                                let mut response = Response::new(Version::Http11, StatusCode::OK);
+                                let disk_info_serialized =
+                                    serde_json::to_string(&add_disk_info).unwrap();
+
+                                response.set_body(Body::new(disk_info_serialized));
+                                response
+                            }
                             Err(e) => error_response(e, StatusCode::InternalServerError),
                         }
                     }
