@@ -17,7 +17,9 @@ extern crate tempfile;
 extern crate url;
 extern crate vmm_sys_util;
 
-use crate::api::{ApiError, ApiRequest, ApiResponse, ApiResponsePayload, VmInfo, VmmPingResponse};
+use crate::api::{
+    AddDiskResponse, ApiError, ApiRequest, ApiResponse, ApiResponsePayload, VmInfo, VmmPingResponse,
+};
 use crate::config::{DeviceConfig, DiskConfig, NetConfig, PmemConfig, RestoreConfig, VmConfig};
 use crate::migration::{recv_vm_snapshot, vm_config_from_snapshot};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
@@ -699,7 +701,11 @@ impl Vmm {
                                     let response = self
                                         .vm_add_disk(add_disk_data.as_ref().clone())
                                         .map_err(ApiError::VmAddDisk)
-                                        .map(|disk_id| ApiResponsePayload::DiskId(disk_id));
+                                        .map(|disk_id| {
+                                            ApiResponsePayload::DiskInfo(AddDiskResponse {
+                                                disk_id,
+                                            })
+                                        });
                                     sender.send(response).map_err(Error::ApiResponseSend)?;
                                 }
                                 ApiRequest::VmAddPmem(add_pmem_data, sender) => {
