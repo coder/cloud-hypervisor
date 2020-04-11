@@ -2074,7 +2074,7 @@ impl DeviceManager {
         &mut self,
         device: VirtioDeviceArc,
         iommu_attached: bool,
-    ) -> DeviceManagerResult<()> {
+    ) -> DeviceManagerResult<u32> {
         if iommu_attached {
             warn!("Placing device behind vIOMMU is not available for hotplugged devices");
         }
@@ -2097,11 +2097,12 @@ impl DeviceManager {
         // Update the PCIU bitmap
         self.pci_devices_up |= 1 << (device_id >> 3);
 
-        Ok(())
+        // @coder patch to get device ids
+        Ok(device_id)
     }
 
     #[cfg(feature = "pci_support")]
-    pub fn add_disk(&mut self, disk_cfg: &mut DiskConfig) -> DeviceManagerResult<()> {
+    pub fn add_disk(&mut self, disk_cfg: &mut DiskConfig) -> DeviceManagerResult<u32> {
         let (device, iommu_attached) = self.make_virtio_block_device(disk_cfg)?;
         self.hotplug_virtio_pci_device(device, iommu_attached)
     }
@@ -2109,13 +2110,15 @@ impl DeviceManager {
     #[cfg(feature = "pci_support")]
     pub fn add_pmem(&mut self, pmem_cfg: &mut PmemConfig) -> DeviceManagerResult<()> {
         let (device, iommu_attached) = self.make_virtio_pmem_device(pmem_cfg)?;
-        self.hotplug_virtio_pci_device(device, iommu_attached)
+        self.hotplug_virtio_pci_device(device, iommu_attached)?;
+        Ok(())
     }
 
     #[cfg(feature = "pci_support")]
     pub fn add_net(&mut self, net_cfg: &mut NetConfig) -> DeviceManagerResult<()> {
         let (device, iommu_attached) = self.make_virtio_net_device(net_cfg)?;
-        self.hotplug_virtio_pci_device(device, iommu_attached)
+        self.hotplug_virtio_pci_device(device, iommu_attached)?;
+        Ok(())
     }
 }
 
