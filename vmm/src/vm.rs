@@ -740,7 +740,7 @@ impl Vm {
                     .lock()
                     .unwrap()
                     .add_disk(&mut _disk_cfg)
-                    .map_err(Error::DeviceManager);
+                    .map_err(Error::DeviceManager)?;
 
                 // Update VmConfig by adding the new device. This is important to
                 // ensure the device would be created in case of a reboot.
@@ -759,7 +759,7 @@ impl Vm {
                     .notify_hotplug(HotPlugNotificationFlags::PCI_DEVICES_CHANGED)
                     .map_err(Error::DeviceManager)?;
 
-                new_disk_id
+                Ok(new_disk_id)
             }
         } else {
             Err(Error::NoPciSupport)
