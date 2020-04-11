@@ -167,6 +167,9 @@ pub enum ApiResponsePayload {
 
     /// Vmm ping response
     VmmPing(VmmPingResponse),
+
+    // id of recently added disk
+    DiskId(u32),
 }
 
 /// This is the response sent by the VMM API server through the mpsc channel.
