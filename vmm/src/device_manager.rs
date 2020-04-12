@@ -2116,7 +2116,8 @@ impl DeviceManager {
     #[cfg(feature = "pci_support")]
     pub fn add_fs(&mut self, fs_cfg: &mut FsConfig) -> DeviceManagerResult<()> {
         let (device, iommu_attached) = self.make_virtio_fs_device(fs_cfg)?;
-        self.hotplug_virtio_pci_device(device, iommu_attached)
+        self.hotplug_virtio_pci_device(device, iommu_attached)?;
+        Ok(())
     }
 
     #[cfg(feature = "pci_support")]
