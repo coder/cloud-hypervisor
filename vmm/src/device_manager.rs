@@ -1411,7 +1411,7 @@ impl DeviceManager {
         let fs_devices = self.config.lock().unwrap().fs.clone();
         if let Some(fs_list_cfg) = &fs_devices {
             for fs_cfg in fs_list_cfg.iter() {
-                if let Some(_) = fs_cfg.sock.to_str() {
+                if fs_cfg.sock.to_str().is_some() {
                     devices.push(self.make_virtio_fs_device(fs_cfg)?);
                 }
             }
