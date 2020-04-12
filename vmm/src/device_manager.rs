@@ -14,7 +14,7 @@ extern crate vm_device;
 use crate::config::ConsoleOutputMode;
 #[cfg(feature = "pci_support")]
 use crate::config::DeviceConfig;
-use crate::config::{DiskConfig, NetConfig, PmemConfig, VmConfig};
+use crate::config::{DiskConfig, FsConfig, NetConfig, PmemConfig, VmConfig};
 use crate::interrupt::{
     KvmLegacyUserspaceInterruptManager, KvmMsiInterruptManager, KvmRoutingEntry,
 };
@@ -99,6 +99,9 @@ pub enum DeviceManagerError {
 
     /// Cannot create virtio-fs device
     CreateVirtioFs(vm_virtio::vhost_user::Error),
+
+    /// Virtio-fs device was created without a sock.
+    NoVirtioFsSock,
 
     /// Cannot create vhost-user-blk device
     CreateVhostUserBlk(vm_virtio::vhost_user::Error),
@@ -1325,88 +1328,91 @@ impl DeviceManager {
         Ok(devices)
     }
 
+    fn make_virtio_fs_device(
+        &mut self,
+        fs_cfg: &FsConfig,
+    ) -> DeviceManagerResult<(VirtioDeviceArc, bool)> {
+        if let Some(fs_sock) = fs_cfg.sock.to_str() {
+            let cache: Option<(VirtioSharedMemoryList, u64)> = if fs_cfg.dax {
+                let fs_cache = fs_cfg.cache_size;
+                // The memory needs to be 2MiB aligned in order to support
+                // hugepages.
+                let fs_guest_addr = self
+                    .address_manager
+                    .allocator
+                    .lock()
+                    .unwrap()
+                    .allocate_mmio_addresses(None, fs_cache as GuestUsize, Some(0x0020_0000))
+                    .ok_or(DeviceManagerError::FsRangeAllocation)?;
+
+                let mmap_region = MmapRegion::build(
+                    None,
+                    fs_cache as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                )
+                .map_err(DeviceManagerError::NewMmapRegion)?;
+                let addr: u64 = mmap_region.as_ptr() as u64;
+
+                self._mmap_regions.push(mmap_region);
+
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .create_userspace_mapping(
+                        fs_guest_addr.raw_value(),
+                        fs_cache,
+                        addr,
+                        false,
+                        false,
+                    )
+                    .map_err(DeviceManagerError::MemoryManager)?;
+
+                let mut region_list = Vec::new();
+                region_list.push(VirtioSharedMemory {
+                    offset: 0,
+                    len: fs_cache,
+                });
+
+                Some((
+                    VirtioSharedMemoryList {
+                        addr: fs_guest_addr,
+                        len: fs_cache as GuestUsize,
+                        region_list,
+                    },
+                    addr,
+                ))
+            } else {
+                None
+            };
+
+            let virtio_fs_device = Arc::new(Mutex::new(
+                vm_virtio::vhost_user::Fs::new(
+                    fs_sock,
+                    &fs_cfg.tag,
+                    fs_cfg.num_queues,
+                    fs_cfg.queue_size,
+                    cache,
+                )
+                .map_err(DeviceManagerError::CreateVirtioFs)?,
+            ));
+
+            self.add_migratable_device(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);
+
+            return Ok((Arc::clone(&virtio_fs_device) as VirtioDeviceArc, false));
+        }
+
+        Err(DeviceManagerError::NoVirtioFsSock)
+    }
+
     fn make_virtio_fs_devices(&mut self) -> DeviceManagerResult<Vec<(VirtioDeviceArc, bool)>> {
         let mut devices = Vec::new();
-        // Add virtio-fs if required
-        if let Some(fs_list_cfg) = &self.config.lock().unwrap().fs {
+
+        let fs_devices = self.config.lock().unwrap().fs.clone();
+        if let Some(fs_list_cfg) = &fs_devices {
             for fs_cfg in fs_list_cfg.iter() {
-                if let Some(fs_sock) = fs_cfg.sock.to_str() {
-                    let cache: Option<(VirtioSharedMemoryList, u64)> = if fs_cfg.dax {
-                        let fs_cache = fs_cfg.cache_size;
-                        // The memory needs to be 2MiB aligned in order to support
-                        // hugepages.
-                        let fs_guest_addr = self
-                            .address_manager
-                            .allocator
-                            .lock()
-                            .unwrap()
-                            .allocate_mmio_addresses(
-                                None,
-                                fs_cache as GuestUsize,
-                                Some(0x0020_0000),
-                            )
-                            .ok_or(DeviceManagerError::FsRangeAllocation)?;
-
-                        let mmap_region = MmapRegion::build(
-                            None,
-                            fs_cache as usize,
-                            libc::PROT_NONE,
-                            libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                        )
-                        .map_err(DeviceManagerError::NewMmapRegion)?;
-                        let addr: u64 = mmap_region.as_ptr() as u64;
-
-                        self._mmap_regions.push(mmap_region);
-
-                        self.memory_manager
-                            .lock()
-                            .unwrap()
-                            .create_userspace_mapping(
-                                fs_guest_addr.raw_value(),
-                                fs_cache,
-                                addr,
-                                false,
-                                false,
-                            )
-                            .map_err(DeviceManagerError::MemoryManager)?;
-
-                        let mut region_list = Vec::new();
-                        region_list.push(VirtioSharedMemory {
-                            offset: 0,
-                            len: fs_cache,
-                        });
-
-                        Some((
-                            VirtioSharedMemoryList {
-                                addr: fs_guest_addr,
-                                len: fs_cache as GuestUsize,
-                                region_list,
-                            },
-                            addr,
-                        ))
-                    } else {
-                        None
-                    };
-
-                    let virtio_fs_device = Arc::new(Mutex::new(
-                        vm_virtio::vhost_user::Fs::new(
-                            fs_sock,
-                            &fs_cfg.tag,
-                            fs_cfg.num_queues,
-                            fs_cfg.queue_size,
-                            cache,
-                        )
-                        .map_err(DeviceManagerError::CreateVirtioFs)?,
-                    ));
-
-                    devices.push((
-                        Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn vm_virtio::VirtioDevice>>,
-                        false,
-                    ));
-
-                    let migratable = Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>;
-                    let id = migratable.lock().unwrap().id();
-                    self.migratable_devices.insert(id, migratable);
+                if fs_cfg.sock.to_str().is_some() {
+                    devices.push(self.make_virtio_fs_device(fs_cfg)?);
                 }
             }
         }
@@ -2105,6 +2111,13 @@ impl DeviceManager {
     pub fn add_disk(&mut self, disk_cfg: &mut DiskConfig) -> DeviceManagerResult<u32> {
         let (device, iommu_attached) = self.make_virtio_block_device(disk_cfg)?;
         self.hotplug_virtio_pci_device(device, iommu_attached)
+    }
+
+    #[cfg(feature = "pci_support")]
+    pub fn add_fs(&mut self, fs_cfg: &mut FsConfig) -> DeviceManagerResult<()> {
+        let (device, iommu_attached) = self.make_virtio_fs_device(fs_cfg)?;
+        self.hotplug_virtio_pci_device(device, iommu_attached)?;
+        Ok(())
     }
 
     #[cfg(feature = "pci_support")]

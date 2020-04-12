@@ -864,6 +864,11 @@ impl Default for FsConfig {
 }
 
 impl FsConfig {
+    pub const SYNTAX: &'static str = "FS parameters \
+         \"tag=<virtio_fs_tag>,dax=on|off,cache_size=<cache_size_bytes>,\
+         num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
+         sock=<virtiofsd_sock_path>\"";
+
     pub fn parse(fs: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
