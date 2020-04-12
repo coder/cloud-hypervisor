@@ -17,7 +17,9 @@ extern crate tempfile;
 extern crate url;
 extern crate vmm_sys_util;
 
-use crate::api::{ApiError, ApiRequest, ApiResponse, ApiResponsePayload, VmInfo, VmmPingResponse};
+use crate::api::{
+    AddDiskResponse, ApiError, ApiRequest, ApiResponse, ApiResponsePayload, VmInfo, VmmPingResponse,
+};
 use crate::config::{
     DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig, VmConfig,
 };
@@ -472,13 +474,14 @@ impl Vmm {
         }
     }
 
-    fn vm_add_disk(&mut self, disk_cfg: DiskConfig) -> result::Result<(), VmError> {
+    fn vm_add_disk(&mut self, disk_cfg: DiskConfig) -> result::Result<u32, VmError> {
         if let Some(ref mut vm) = self.vm {
-            if let Err(e) = vm.add_disk(disk_cfg) {
-                error!("Error when adding new disk to the VM: {:?}", e);
-                Err(e)
-            } else {
-                Ok(())
+            match vm.add_disk(disk_cfg) {
+                Err(e) => {
+                    error!("Error when adding new disk to the VM: {:?}", e);
+                    Err(e)
+                }
+                Ok(device_id) => Ok(device_id),
             }
         } else {
             Err(VmError::VmNotRunning)
@@ -713,7 +716,11 @@ impl Vmm {
                                     let response = self
                                         .vm_add_disk(add_disk_data.as_ref().clone())
                                         .map_err(ApiError::VmAddDisk)
-                                        .map(|_| ApiResponsePayload::Empty);
+                                        .map(|disk_id| {
+                                            ApiResponsePayload::DiskInfo(AddDiskResponse {
+                                                disk_id,
+                                            })
+                                        });
                                     sender.send(response).map_err(Error::ApiResponseSend)?;
                                 }
                                 ApiRequest::VmAddFs(add_fs_data, sender) => {

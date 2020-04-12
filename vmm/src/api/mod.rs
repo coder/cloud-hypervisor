@@ -163,6 +163,11 @@ pub struct VmSnapshotConfig {
     pub destination_url: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+pub struct AddDiskResponse {
+    pub disk_id: u32,
+}
+
 pub enum ApiResponsePayload {
     /// No data is sent on the channel.
     Empty,
@@ -172,6 +177,9 @@ pub enum ApiResponsePayload {
 
     /// Vmm ping response
     VmmPing(VmmPingResponse),
+
+    // info of added disk
+    DiskInfo(AddDiskResponse),
 }
 
 /// This is the response sent by the VMM API server through the mpsc channel.
@@ -478,7 +486,7 @@ pub fn vm_add_disk(
     api_evt: EventFd,
     api_sender: Sender<ApiRequest>,
     data: Arc<DiskConfig>,
-) -> ApiResult<()> {
+) -> ApiResult<AddDiskResponse> {
     let (response_sender, response_receiver) = channel();
 
     // Send the VM add-disk request.
@@ -487,9 +495,12 @@ pub fn vm_add_disk(
         .map_err(ApiError::RequestSend)?;
     api_evt.write(1).map_err(ApiError::EventFdWrite)?;
 
-    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+    let response = response_receiver.recv().map_err(ApiError::ResponseRecv)??;
 
-    Ok(())
+    match response {
+        ApiResponsePayload::DiskInfo(add_disk_info) => Ok(add_disk_info),
+        _ => Err(ApiError::ResponsePayloadType), // TODO@coder: this could be better across the project, cleanup
+    }
 }
 
 pub fn vm_add_fs(

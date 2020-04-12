@@ -732,11 +732,12 @@ impl Vm {
         }
     }
 
-    pub fn add_disk(&mut self, mut _disk_cfg: DiskConfig) -> Result<()> {
+    pub fn add_disk(&mut self, mut _disk_cfg: DiskConfig) -> Result<u32> {
         if cfg!(feature = "pci_support") {
             #[cfg(feature = "pci_support")]
             {
-                self.device_manager
+                let new_disk_id = self
+                    .device_manager
                     .lock()
                     .unwrap()
                     .add_disk(&mut _disk_cfg)
@@ -758,8 +759,9 @@ impl Vm {
                     .unwrap()
                     .notify_hotplug(HotPlugNotificationFlags::PCI_DEVICES_CHANGED)
                     .map_err(Error::DeviceManager)?;
+
+                Ok(new_disk_id)
             }
-            Ok(())
         } else {
             Err(Error::NoPciSupport)
         }
