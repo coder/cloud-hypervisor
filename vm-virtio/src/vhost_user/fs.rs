@@ -6,14 +6,14 @@ use super::Error as DeviceError;
 use super::{Error, Result};
 use crate::vhost_user::handler::{VhostUserEpollConfig, VhostUserEpollHandler};
 use crate::{
-    ActivateError, ActivateResult, Queue, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
-    VirtioSharedMemoryList, VIRTIO_F_VERSION_1,
+    ActivateError, ActivateResult, Queue, UserspaceMapping, VirtioDevice, VirtioDeviceType,
+    VirtioInterrupt, VirtioSharedMemoryList, VIRTIO_F_VERSION_1,
 };
 use libc::{self, c_void, off64_t, pread64, pwrite64, EFD_NONBLOCK};
 use std::cmp;
 use std::io;
 use std::io::Write;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,7 @@ use vhost_rs::vhost_user::{
 use vhost_rs::VhostBackend;
 use vm_memory::{
     Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap,
+    MmapRegion,
 };
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
@@ -258,7 +259,9 @@ pub struct Fs {
     config: VirtioFsConfig,
     kill_evt: Option<EventFd>,
     pause_evt: Option<EventFd>,
-    cache: Option<(VirtioSharedMemoryList, u64)>,
+    // Hold ownership of the memory that is allocated for the device
+    // which will be automatically dropped when the device is dropped
+    cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
     slave_req_support: bool,
     queue_evts: Option<Vec<EventFd>>,
     interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
@@ -273,7 +276,7 @@ impl Fs {
         tag: &str,
         req_num_queues: usize,
         queue_size: u16,
-        cache: Option<(VirtioSharedMemoryList, u64)>,
+        cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
     ) -> Result<Fs> {
         let mut slave_req_support = false;
 
@@ -471,11 +474,11 @@ impl VirtioDevice for Fs {
 
         // Initialize slave communication.
         let slave_req_handler = if self.slave_req_support {
-            if let Some(cache) = self.cache.clone() {
+            if let Some(cache) = self.cache.as_ref() {
                 let vu_master_req_handler = Arc::new(Mutex::new(SlaveReqHandler {
                     cache_offset: cache.0.addr,
                     cache_size: cache.0.len,
-                    mmap_cache_addr: cache.1,
+                    mmap_cache_addr: cache.0.host_addr,
                 }));
 
                 let req_handler = MasterReqHandler::new(vu_master_req_handler).map_err(|e| {
@@ -541,16 +544,47 @@ impl VirtioDevice for Fs {
         ))
     }
 
+    fn shutdown(&mut self) {
+        let _ = unsafe { libc::close(self.vu.as_raw_fd()) };
+    }
+
     fn get_shm_regions(&self) -> Option<VirtioSharedMemoryList> {
-        if let Some(cache) = self.cache.clone() {
-            Some(cache.0)
+        if let Some(cache) = self.cache.as_ref() {
+            Some(cache.0.clone())
         } else {
             None
         }
     }
 
+    fn set_shm_regions(
+        &mut self,
+        shm_regions: VirtioSharedMemoryList,
+    ) -> std::result::Result<(), crate::Error> {
+        if let Some(mut cache) = self.cache.as_mut() {
+            cache.0 = shm_regions;
+            Ok(())
+        } else {
+            Err(crate::Error::SetShmRegionsNotSupported)
+        }
+    }
+
     fn update_memory(&mut self, mem: &GuestMemoryMmap) -> std::result::Result<(), crate::Error> {
         update_mem_table(&mut self.vu, mem).map_err(crate::Error::VhostUserUpdateMemory)
+    }
+
+    fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
+        let mut mappings = Vec::new();
+        if let Some(cache) = self.cache.as_ref() {
+            mappings.push(UserspaceMapping {
+                host_addr: cache.0.host_addr,
+                mem_slot: cache.0.mem_slot,
+                addr: cache.0.addr,
+                len: cache.0.len,
+                mergeable: false,
+            })
+        }
+
+        mappings
     }
 }
 

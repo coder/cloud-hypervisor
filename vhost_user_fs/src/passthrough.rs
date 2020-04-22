@@ -4,6 +4,7 @@
 
 use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
@@ -557,7 +558,13 @@ impl PassthroughFs {
                 OpenOptions::DIRECT_IO,
                 flags & (libc::O_DIRECTORY as u32) == 0,
             ),
-            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            CachePolicy::Always => {
+                if flags & (libc::O_DIRECTORY as u32) == 0 {
+                    opts |= OpenOptions::KEEP_CACHE;
+                } else {
+                    opts |= OpenOptions::CACHE_DIR;
+                }
+            }
             _ => {}
         };
 
@@ -991,11 +998,15 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         _lock_owner: Option<u64>,
         _delayed_write: bool,
+        kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
-        // We need to change credentials during a write so that the kernel will remove setuid or
-        // setgid bits from the file if it was written to by someone other than the owner.
-        let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+        if kill_priv {
+            // We need to change credentials during a write so that the kernel will remove setuid
+            // or setgid bits from the file if it was written to by someone other than the owner.
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+        }
+
         let data = self
             .handles
             .read()
@@ -1642,6 +1653,61 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::last_os_error())
         } else {
             Ok(res as u64)
+        }
+    }
+
+    fn copyfilerange(
+        &self,
+        _ctx: Context,
+        inode_in: Inode,
+        handle_in: Handle,
+        offset_in: u64,
+        inode_out: Inode,
+        handle_out: Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        let data_in = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle_in)
+            .filter(|hd| hd.inode == inode_in)
+            .map(Arc::clone)
+            .ok_or_else(ebadf)?;
+
+        // Take just a read lock as we're not going to alter the file descriptor offset.
+        let fd_in = data_in.file.read().unwrap().as_raw_fd();
+
+        let data_out = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle_out)
+            .filter(|hd| hd.inode == inode_out)
+            .map(Arc::clone)
+            .ok_or_else(ebadf)?;
+
+        // Take just a read lock as we're not going to alter the file descriptor offset.
+        let fd_out = data_out.file.read().unwrap().as_raw_fd();
+
+        // Safe because this will only modify `offset_in` and `offset_out` and we check
+        // the return value.
+        let res = unsafe {
+            libc::copy_file_range(
+                fd_in,
+                &mut (offset_in as i64) as &mut _ as *mut _,
+                fd_out,
+                &mut (offset_out as i64) as &mut _ as *mut _,
+                len.try_into().unwrap(),
+                flags.try_into().unwrap(),
+            )
+        };
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(res as usize)
         }
     }
 }

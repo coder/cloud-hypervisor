@@ -189,9 +189,9 @@ paths:
 
   /vm.add-fs:
     put:
-      summary: Add a new virtio-fs backed FS device to the VM
+      summary: Add a new virtio-fs device to the VM
       requestBody:
-        description: The details of the new FS
+        description: The details of the new virtio-fs
         content:
           application/json:
             schema:
@@ -199,9 +199,9 @@ paths:
         required: true
       responses:
         204:
-          description: The new FS was successfully added to the VM instance.
+          description: The new device was successfully added to the VM instance.
         500:
-          description: The new FS could not be added to the VM instance.
+          description: The new device could not be added to the VM instance.
 
   /vm.add-pmem:
     put:

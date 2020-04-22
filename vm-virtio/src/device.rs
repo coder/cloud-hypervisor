@@ -35,6 +35,15 @@ pub type VirtioIommuRemapping =
     Box<dyn Fn(u64) -> std::result::Result<u64, std::io::Error> + Send + Sync>;
 
 #[derive(Clone)]
+pub struct UserspaceMapping {
+    pub host_addr: u64,
+    pub mem_slot: u32,
+    pub addr: GuestAddress,
+    pub len: GuestUsize,
+    pub mergeable: bool,
+}
+
+#[derive(Clone)]
 pub struct VirtioSharedMemory {
     pub offset: u64,
     pub len: u64,
@@ -42,6 +51,8 @@ pub struct VirtioSharedMemory {
 
 #[derive(Clone)]
 pub struct VirtioSharedMemoryList {
+    pub host_addr: u64,
+    pub mem_slot: u32,
     pub addr: GuestAddress,
     pub len: GuestUsize,
     pub region_list: Vec<VirtioSharedMemory>,
@@ -97,6 +108,14 @@ pub trait VirtioDevice: Send {
         None
     }
 
+    /// Updates the list of shared memory regions required by the device.
+    fn set_shm_regions(
+        &mut self,
+        _shm_regions: VirtioSharedMemoryList,
+    ) -> std::result::Result<(), Error> {
+        std::unimplemented!()
+    }
+
     fn iommu_translate(&self, addr: u64) -> u64 {
         addr
     }
@@ -109,6 +128,11 @@ pub trait VirtioDevice: Send {
 
     fn update_memory(&mut self, _mem: &GuestMemoryMmap) -> std::result::Result<(), Error> {
         Ok(())
+    }
+
+    /// Returns the list of userspace mappings associated with this device.
+    fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
+        Vec::new()
     }
 }
 

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::convert::TryInto;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -124,6 +125,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Readdirplus as u32 => self.readdirplus(in_header, r, w),
             x if x == Opcode::Rename2 as u32 => self.rename2(in_header, r, w),
             x if x == Opcode::Lseek as u32 => self.lseek(in_header, r, w),
+            x if x == Opcode::CopyFileRange as u32 => self.copyfilerange(in_header, r, w),
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(in_header, r, w, vu_req),
             x if x == Opcode::RemoveMapping as u32 => self.removemapping(in_header, r, w, vu_req),
             _ => reply_error(
@@ -634,6 +636,7 @@ impl<F: FileSystem + Sync> Server<F> {
         };
 
         let delayed_write = write_flags & WRITE_CACHE != 0;
+        let kill_priv = write_flags & WRITE_KILL_PRIV != 0;
 
         let data_reader = ZCReader(r);
 
@@ -646,6 +649,7 @@ impl<F: FileSystem + Sync> Server<F> {
             offset,
             owner,
             delayed_write,
+            kill_priv,
             flags,
         ) {
             Ok(count) => {
@@ -902,9 +906,13 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::HANDLE_KILLPRIV
             | FsOptions::ASYNC_DIO
             | FsOptions::HAS_IOCTL_DIR
-            | FsOptions::ATOMIC_O_TRUNC;
+            | FsOptions::ATOMIC_O_TRUNC
+            | FsOptions::MAX_PAGES;
 
         let capable = FsOptions::from_bits_truncate(flags);
+
+        let page_size: u32 = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
+        let max_pages = ((MAX_BUFFER_SIZE - 1) / page_size) + 1;
 
         match self.fs.init(capable) {
             Ok(want) => {
@@ -919,6 +927,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     congestion_threshold: (::std::u16::MAX / 4) * 3,
                     max_write: MAX_BUFFER_SIZE,
                     time_gran: 1, // nanoseconds
+                    max_pages: max_pages.try_into().unwrap(),
                     ..Default::default()
                 };
 
@@ -1255,6 +1264,41 @@ impl<F: FileSystem + Sync> Server<F> {
         ) {
             Ok(offset) => {
                 let out = LseekOut { offset };
+
+                reply_ok(Some(out), None, in_header.unique, w)
+            }
+            Err(e) => reply_error(e, in_header.unique, w),
+        }
+    }
+
+    fn copyfilerange(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+        let CopyfilerangeIn {
+            fh_in,
+            off_in,
+            nodeid_out,
+            fh_out,
+            off_out,
+            len,
+            flags,
+            ..
+        } = r.read_obj().map_err(Error::DecodeMessage)?;
+
+        match self.fs.copyfilerange(
+            Context::from(in_header),
+            in_header.nodeid.into(),
+            fh_in.into(),
+            off_in,
+            nodeid_out.into(),
+            fh_out.into(),
+            off_out,
+            len,
+            flags,
+        ) {
+            Ok(count) => {
+                let out = WriteOut {
+                    size: count as u32,
+                    ..Default::default()
+                };
 
                 reply_ok(Some(out), None, in_header.unique, w)
             }

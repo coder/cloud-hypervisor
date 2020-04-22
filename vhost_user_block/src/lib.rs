@@ -23,19 +23,20 @@ use std::io::Read;
 use std::io::{Seek, SeekFrom, Write};
 use std::mem;
 use std::num::Wrapping;
+use std::ops::DerefMut;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process;
 use std::slice;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use std::vec::Vec;
 use std::{convert, error, fmt, io};
 use vhost_rs::vhost_user::message::*;
-use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringWorker};
+use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring};
 use virtio_bindings::bindings::virtio_blk::*;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use vm_memory::{Bytes, GuestMemoryError, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestMemoryMmap};
 use vm_virtio::block::{build_disk_image_id, Request};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -51,17 +52,11 @@ const POLL_QUEUE_US: u128 = 50;
 trait DiskFile: Read + Seek + Write + Send + Sync {}
 impl<D: Read + Seek + Write + Send + Sync> DiskFile for D {}
 
-pub type Result<T> = std::result::Result<T, Error>;
-pub type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
+type Result<T> = std::result::Result<T, Error>;
+type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
 
 #[derive(Debug)]
-pub enum Error {
-    /// Failed to detect image type.
-    DetectImageType,
-    /// Bad memory address.
-    GuestMemory(GuestMemoryError),
-    /// Can't open image file.
-    OpenImage,
+enum Error {
     /// Failed to parse direct parameter.
     ParseDirectParam,
     /// Failed to parse image parameter.
@@ -96,70 +91,32 @@ impl convert::From<Error> for io::Error {
     }
 }
 
-pub struct VhostUserBlkBackend {
+struct VhostUserBlkThread {
     mem: Option<GuestMemoryMmap>,
-    vring_worker: Option<Arc<VringWorker>>,
-    disk_image: Box<dyn DiskFile>,
+    disk_image: Arc<Mutex<dyn DiskFile>>,
     disk_image_id: Vec<u8>,
     disk_nsectors: u64,
-    config: virtio_blk_config,
-    rdonly: bool,
-    poll_queue: bool,
     event_idx: bool,
     kill_evt: EventFd,
 }
 
-impl VhostUserBlkBackend {
-    pub fn new(
-        image_path: String,
-        num_queues: usize,
-        rdonly: bool,
-        direct: bool,
-        poll_queue: bool,
+impl VhostUserBlkThread {
+    fn new(
+        disk_image: Arc<Mutex<dyn DiskFile>>,
+        disk_image_id: Vec<u8>,
+        disk_nsectors: u64,
     ) -> Result<Self> {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        options.write(!rdonly);
-        if direct {
-            options.custom_flags(libc::O_DIRECT);
-        }
-        let image: File = options.open(&image_path).unwrap();
-        let mut raw_img: vm_virtio::RawFile = vm_virtio::RawFile::new(image, direct);
-
-        let image_id = build_disk_image_id(&PathBuf::from(&image_path));
-        let image_type = qcow::detect_image_type(&mut raw_img).unwrap();
-        let mut image = match image_type {
-            ImageType::Raw => Box::new(raw_img) as Box<dyn DiskFile>,
-            ImageType::Qcow2 => Box::new(QcowFile::from(raw_img).unwrap()) as Box<dyn DiskFile>,
-        };
-
-        let nsectors = (image.seek(SeekFrom::End(0)).unwrap() as u64) / SECTOR_SIZE;
-        let mut config = virtio_blk_config::default();
-
-        config.capacity = nsectors;
-        config.blk_size = BLK_SIZE;
-        config.size_max = 65535;
-        config.seg_max = 128 - 2;
-        config.min_io_size = 1;
-        config.opt_io_size = 1;
-        config.num_queues = num_queues as u16;
-        config.wce = 1;
-
-        Ok(VhostUserBlkBackend {
+        Ok(VhostUserBlkThread {
             mem: None,
-            vring_worker: None,
-            disk_image: image,
-            disk_image_id: image_id,
-            disk_nsectors: nsectors,
-            config,
-            rdonly,
-            poll_queue,
+            disk_image,
+            disk_image_id,
+            disk_nsectors,
             event_idx: false,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
         })
     }
 
-    pub fn process_queue(&mut self, vring: &mut Vring) -> bool {
+    fn process_queue(&mut self, vring: &mut Vring) -> bool {
         let mut used_any = false;
         let mem = match self.mem.as_ref() {
             Some(m) => m,
@@ -173,7 +130,7 @@ impl VhostUserBlkBackend {
                 Ok(request) => {
                     debug!("element is a valid request");
                     let status = match request.execute(
-                        &mut self.disk_image,
+                        &mut self.disk_image.lock().unwrap().deref_mut(),
                         self.disk_nsectors,
                         mem,
                         &self.disk_image_id,
@@ -215,9 +172,73 @@ impl VhostUserBlkBackend {
 
         used_any
     }
+}
 
-    pub fn set_vring_worker(&mut self, vring_worker: Option<Arc<VringWorker>>) {
-        self.vring_worker = vring_worker;
+struct VhostUserBlkBackend {
+    threads: Vec<Mutex<VhostUserBlkThread>>,
+    config: virtio_blk_config,
+    rdonly: bool,
+    poll_queue: bool,
+    queues_per_thread: Vec<u64>,
+}
+
+impl VhostUserBlkBackend {
+    fn new(
+        image_path: String,
+        num_queues: usize,
+        rdonly: bool,
+        direct: bool,
+        poll_queue: bool,
+    ) -> Result<Self> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.write(!rdonly);
+        if direct {
+            options.custom_flags(libc::O_DIRECT);
+        }
+        let image: File = options.open(&image_path).unwrap();
+        let mut raw_img: vm_virtio::RawFile = vm_virtio::RawFile::new(image, direct);
+
+        let image_id = build_disk_image_id(&PathBuf::from(&image_path));
+        let image_type = qcow::detect_image_type(&mut raw_img).unwrap();
+        let image = match image_type {
+            ImageType::Raw => Arc::new(Mutex::new(raw_img)) as Arc<Mutex<dyn DiskFile>>,
+            ImageType::Qcow2 => {
+                Arc::new(Mutex::new(QcowFile::from(raw_img).unwrap())) as Arc<Mutex<dyn DiskFile>>
+            }
+        };
+
+        let nsectors = (image.lock().unwrap().seek(SeekFrom::End(0)).unwrap() as u64) / SECTOR_SIZE;
+        let mut config = virtio_blk_config::default();
+
+        config.capacity = nsectors;
+        config.blk_size = BLK_SIZE;
+        config.size_max = 65535;
+        config.seg_max = 128 - 2;
+        config.min_io_size = 1;
+        config.opt_io_size = 1;
+        config.num_queues = num_queues as u16;
+        config.wce = 1;
+
+        let mut queues_per_thread = Vec::new();
+        let mut threads = Vec::new();
+        for i in 0..num_queues {
+            let thread = Mutex::new(VhostUserBlkThread::new(
+                image.clone(),
+                image_id.clone(),
+                nsectors,
+            )?);
+            threads.push(thread);
+            queues_per_thread.push(0b1 << i);
+        }
+
+        Ok(VhostUserBlkBackend {
+            threads,
+            config,
+            rdonly,
+            poll_queue,
+            queues_per_thread,
+        })
     }
 }
 
@@ -248,19 +269,24 @@ impl VhostUserBackend for VhostUserBlkBackend {
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
-        self.event_idx = enabled;
+        for thread in self.threads.iter() {
+            thread.lock().unwrap().event_idx = enabled;
+        }
     }
 
     fn update_memory(&mut self, mem: GuestMemoryMmap) -> VhostUserBackendResult<()> {
-        self.mem = Some(mem);
+        for thread in self.threads.iter() {
+            thread.lock().unwrap().mem = Some(mem.clone());
+        }
         Ok(())
     }
 
     fn handle_event(
-        &mut self,
+        &self,
         device_event: u16,
         evset: epoll::Events,
         vrings: &[Arc<RwLock<Vring>>],
+        thread_id: usize,
     ) -> VhostUserBackendResult<bool> {
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
@@ -268,16 +294,17 @@ impl VhostUserBackend for VhostUserBlkBackend {
 
         debug!("event received: {:?}", device_event);
 
+        let mut thread = self.threads[thread_id].lock().unwrap();
         match device_event {
-            q if device_event < self.config.num_queues => {
-                let mut vring = vrings[q as usize].write().unwrap();
+            0 => {
+                let mut vring = vrings[0].write().unwrap();
 
                 if self.poll_queue {
                     // Actively poll the queue until POLL_QUEUE_US has passed
                     // without seeing a new request.
                     let mut now = Instant::now();
                     loop {
-                        if self.process_queue(&mut vring) {
+                        if thread.process_queue(&mut vring) {
                             now = Instant::now();
                         } else if now.elapsed().as_micros() > POLL_QUEUE_US {
                             break;
@@ -285,7 +312,7 @@ impl VhostUserBackend for VhostUserBlkBackend {
                     }
                 }
 
-                if self.event_idx {
+                if thread.event_idx {
                     // vm-virtio's Queue implementation only checks avail_index
                     // once, so to properly support EVENT_IDX we need to keep
                     // calling process_queue() until it stops finding new
@@ -293,14 +320,14 @@ impl VhostUserBackend for VhostUserBlkBackend {
                     loop {
                         vring
                             .mut_queue()
-                            .update_avail_event(self.mem.as_ref().unwrap());
-                        if !self.process_queue(&mut vring) {
+                            .update_avail_event(thread.mem.as_ref().unwrap());
+                        if !thread.process_queue(&mut vring) {
                             break;
                         }
                     }
                 } else {
                     // Without EVENT_IDX, a single call is enough.
-                    self.process_queue(&mut vring);
+                    thread.process_queue(&mut vring);
                 }
 
                 Ok(false)
@@ -321,22 +348,35 @@ impl VhostUserBackend for VhostUserBlkBackend {
         buf.to_vec()
     }
 
-    fn exit_event(&self) -> Option<(EventFd, Option<u16>)> {
-        Some((self.kill_evt.try_clone().unwrap(), None))
+    fn exit_event(&self, thread_index: usize) -> Option<(EventFd, Option<u16>)> {
+        // The exit event is placed after the queue, which is event index 1.
+        Some((
+            self.threads[thread_index]
+                .lock()
+                .unwrap()
+                .kill_evt
+                .try_clone()
+                .unwrap(),
+            Some(1),
+        ))
+    }
+
+    fn queues_per_thread(&self) -> Vec<u64> {
+        self.queues_per_thread.clone()
     }
 }
 
-pub struct VhostUserBlkBackendConfig<'a> {
-    pub image: &'a str,
-    pub sock: &'a str,
-    pub num_queues: usize,
-    pub readonly: bool,
-    pub direct: bool,
-    pub poll_queue: bool,
+struct VhostUserBlkBackendConfig<'a> {
+    image: &'a str,
+    sock: &'a str,
+    num_queues: usize,
+    readonly: bool,
+    direct: bool,
+    poll_queue: bool,
 }
 
 impl<'a> VhostUserBlkBackendConfig<'a> {
-    pub fn parse(backend: &'a str) -> Result<Self> {
+    fn parse(backend: &'a str) -> Result<Self> {
         let params_list: Vec<&str> = backend.split(',').collect();
 
         let mut image: &str = "";
@@ -425,12 +465,6 @@ pub fn start_block_backend(backend_command: &str) {
     .unwrap();
     debug!("blk_daemon is created!\n");
 
-    let vring_worker = blk_daemon.get_vring_worker();
-    blk_backend
-        .write()
-        .unwrap()
-        .set_vring_worker(Some(vring_worker));
-
     if let Err(e) = blk_daemon.start() {
         error!(
             "Failed to start daemon for vhost-user-block with error: {:?}\n",
@@ -443,8 +477,9 @@ pub fn start_block_backend(backend_command: &str) {
         error!("Error from the main thread: {:?}", e);
     }
 
-    let kill_evt = &blk_backend.write().unwrap().kill_evt;
-    if let Err(e) = kill_evt.write(1) {
-        error!("Error shutting down worker thread: {:?}", e)
+    for thread in blk_backend.read().unwrap().threads.iter() {
+        if let Err(e) = thread.lock().unwrap().kill_evt.write(1) {
+            error!("Error shutting down worker thread: {:?}", e)
+        }
     }
 }

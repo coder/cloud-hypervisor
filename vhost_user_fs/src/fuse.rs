@@ -55,6 +55,9 @@ const FOPEN_KEEP_CACHE: u32 = 2;
 /// The file is not seekable.
 const FOPEN_NONSEEKABLE: u32 = 4;
 
+/// Allow caching this directory.
+const FOPEN_CACHE_DIR: u32 = 8;
+
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
@@ -62,6 +65,7 @@ bitflags! {
         const DIRECT_IO = FOPEN_DIRECT_IO;
         const KEEP_CACHE = FOPEN_KEEP_CACHE;
         const NONSEEKABLE = FOPEN_NONSEEKABLE;
+        const CACHE_DIR = FOPEN_CACHE_DIR;
     }
 }
 
@@ -129,6 +133,21 @@ const HANDLE_KILLPRIV: u32 = 524_288;
 
 /// FileSystem supports posix acls.
 const POSIX_ACL: u32 = 1_048_576;
+
+/// Reading the device after abort returns ECONNABORTED.
+const ABORT_ERROR: u32 = 2_097_152;
+
+/// Init_out.max_pages contains the max number of req pages.
+const MAX_PAGES: u32 = 4_194_304;
+
+/// Cache READLINK responses
+const CACHE_SYMLINKS: u32 = 8_388_608;
+
+/// Kernel supports zero-message opendir
+const NO_OPENDIR_SUPPORT: u32 = 16_777_216;
+
+/// Only invalidate cached pages on explicit request
+const EXPLICIT_INVAL_DATA: u32 = 33_554_432;
 
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
@@ -296,6 +315,43 @@ bitflags! {
         ///
         /// This feature is disabled by default.
         const POSIX_ACL = POSIX_ACL;
+
+        /// Indicates that if the connection is gone because of sysfs abort, reading from the device
+        /// will return -ECONNABORTED.
+        ///
+        /// This feature is not currently supported.
+        const ABORT_ERROR = ABORT_ERROR;
+
+        /// Indicates support for negotiating the maximum number of pages supported.
+        ///
+        /// If this feature is enabled, we can tell the kernel the maximum number of pages that we
+        /// support to transfer in a single request.
+        ///
+        /// This feature is enabled by default if supported by the kernel.
+        const MAX_PAGES = MAX_PAGES;
+
+        /// Indicates that the kernel supports caching READLINK responses.
+        ///
+        /// This feature is not currently supported.
+        const CACHE_SYMLINKS = CACHE_SYMLINKS;
+
+        /// Indicates support for zero-message opens. If this flag is set in the `capable` parameter
+        /// of the `init` trait method, then the file system may return `ENOSYS` from the opendir() handler
+        /// to indicate success. Further attempts to open directories will be handled in the kernel. (If
+        /// this flag is not set, returning ENOSYS will be treated as an error and signaled to the
+        /// caller).
+        ///
+        /// Setting (or not setting) the field in the `FsOptions` returned from the `init` method
+        /// has no effect.
+        const ZERO_MESSAGE_OPENDIR = NO_OPENDIR_SUPPORT;
+
+        /// Indicates support for explicit data invalidation. If this feature is enabled, the
+        /// server is fully responsible for data cache invalidation, and the kernel won't
+        /// invalidate files data cache on size change and only truncate that cache to new size
+        /// in case the size decreased.
+        ///
+        /// This feature is not currently supported.
+        const EXPLICIT_INVAL_DATA = EXPLICIT_INVAL_DATA;
     }
 }
 
@@ -317,6 +373,9 @@ pub const WRITE_CACHE: u32 = 1;
 /// `lock_owner` field is valid.
 pub const WRITE_LOCKOWNER: u32 = 2;
 
+/// Kill suid and sgid bits
+pub const WRITE_KILL_PRIV: u32 = 4;
+
 // Read flags.
 pub const READ_LOCKOWNER: u32 = 2;
 
@@ -337,6 +396,9 @@ const IOCTL_32BIT: u32 = 8;
 /// Is a directory
 const IOCTL_DIR: u32 = 16;
 
+/// x32 compat ioctl on 64bit machine (64bit time_t)
+const IOCTL_COMPAT_X32: u32 = 32;
+
 /// Maximum of in_iovecs + out_iovecs
 const IOCTL_MAX_IOV: u32 = 256;
 
@@ -356,6 +418,9 @@ bitflags! {
 
         /// Is a directory
         const IOCTL_DIR = IOCTL_DIR;
+
+        /// x32 compat ioctl on 64bit machine (64bit time_t)
+        const IOCTL_COMPAT_X32 = IOCTL_COMPAT_X32;
 
         /// Maximum of in_iovecs + out_iovecs
         const IOCTL_MAX_IOV = IOCTL_MAX_IOV;
@@ -835,7 +900,9 @@ pub struct InitOut {
     pub congestion_threshold: u16,
     pub max_write: u32,
     pub time_gran: u32,
-    pub unused: [u32; 9],
+    pub max_pages: u16,
+    pub padding: u16,
+    pub unused: [u32; 8],
 }
 unsafe impl ByteValued for InitOut {}
 
@@ -1048,6 +1115,19 @@ pub struct LseekOut {
     pub offset: u64,
 }
 unsafe impl ByteValued for LseekOut {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct CopyfilerangeIn {
+    pub fh_in: u64,
+    pub off_in: u64,
+    pub nodeid_out: u64,
+    pub fh_out: u64,
+    pub off_out: u64,
+    pub len: u64,
+    pub flags: u64,
+}
+unsafe impl ByteValued for CopyfilerangeIn {}
 
 bitflags! {
     pub struct SetupmappingFlags: u64 {

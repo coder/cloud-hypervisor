@@ -300,6 +300,9 @@ pub struct VirtioPciDevice {
     // needed when the guest tries to early access the virtio configuration of
     // a device.
     cap_pci_cfg_info: VirtioPciCfgCapInfo,
+
+    // Details of bar regions to free
+    bar_regions: Vec<(GuestAddress, GuestUsize, PciBarRegionType)>,
 }
 
 impl VirtioPciDevice {
@@ -370,6 +373,7 @@ impl VirtioPciDevice {
         let configuration = PciConfiguration::new(
             VIRTIO_PCI_VENDOR_ID,
             pci_device_id,
+            0x1, // For modern virtio-PCI devices
             class,
             subclass,
             None,
@@ -402,6 +406,7 @@ impl VirtioPciDevice {
             use_64bit_bar,
             interrupt_source_group,
             cap_pci_cfg_info: VirtioPciCfgCapInfo::default(),
+            bar_regions: vec![],
         };
 
         if let Some(msix_config) = &virtio_pci_device.msix_config {
@@ -559,6 +564,10 @@ impl VirtioPciDevice {
                 unsafe { std::mem::transmute(self.cap_pci_cfg_info.cap.cap.offset) };
             self.write_bar(0, bar_offset as u64, data)
         }
+    }
+
+    pub fn virtio_device(&self) -> Arc<Mutex<dyn VirtioDevice>> {
+        self.device.clone()
     }
 }
 
@@ -721,6 +730,8 @@ impl PciDevice for VirtioPciDevice {
             ranges.push((addr, CAPABILITY_BAR_SIZE, region_type));
             (addr, region_type)
         };
+        self.bar_regions
+            .push((virtio_pci_bar_addr, CAPABILITY_BAR_SIZE, region_type));
 
         let config = PciBarConfiguration::default()
             .set_register_index(0)
@@ -746,6 +757,11 @@ impl PciDevice for VirtioPciDevice {
                     PciDeviceError::IoRegistrationFailed(shm_list.addr.raw_value(), e)
                 })? as u8;
 
+            let region_type = PciBarRegionType::Memory64BitRegion;
+            ranges.push((shm_list.addr, shm_list.len, region_type));
+            self.bar_regions
+                .push((shm_list.addr, shm_list.len, region_type));
+
             for (idx, shm) in shm_list.region_list.iter().enumerate() {
                 let shm_cap = VirtioPciCap64::new(
                     PciCapabilityType::SharedMemoryConfig,
@@ -761,6 +777,36 @@ impl PciDevice for VirtioPciDevice {
         }
 
         Ok(ranges)
+    }
+
+    fn free_bars(
+        &mut self,
+        allocator: &mut SystemAllocator,
+    ) -> std::result::Result<(), PciDeviceError> {
+        for (addr, length, type_) in self.bar_regions.drain(..) {
+            match type_ {
+                PciBarRegionType::Memory32BitRegion => {
+                    allocator.free_mmio_hole_addresses(addr, length);
+                }
+                PciBarRegionType::Memory64BitRegion => {
+                    allocator.free_mmio_addresses(addr, length);
+                }
+                _ => error!("Unexpected PCI bar type"),
+            }
+        }
+        Ok(())
+    }
+
+    fn move_bar(&mut self, old_base: u64, new_base: u64) -> result::Result<(), std::io::Error> {
+        // We only update our idea of the bar in order to support free_bars() above.
+        // The majority of the reallocation is done inside DeviceManager.
+        for (addr, _, _) in self.bar_regions.iter_mut() {
+            if (*addr).0 == old_base {
+                *addr = GuestAddress(new_base);
+            }
+        }
+
+        Ok(())
     }
 
     fn read_bar(&mut self, _base: u64, offset: u64, data: &mut [u8]) {

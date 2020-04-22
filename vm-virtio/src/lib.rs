@@ -16,6 +16,10 @@ extern crate epoll;
 extern crate log;
 #[cfg(feature = "pci_support")]
 extern crate pci;
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
+extern crate serde_json;
 extern crate vhost_rs;
 extern crate virtio_bindings;
 extern crate vm_device;
@@ -182,4 +186,5 @@ pub enum Error {
     FailedSignalingDriver(io::Error),
     VhostUserUpdateMemory(vhost_user::Error),
     EventfdError(io::Error),
+    SetShmRegionsNotSupported,
 }

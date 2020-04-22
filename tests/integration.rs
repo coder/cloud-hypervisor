@@ -1775,6 +1775,7 @@ mod tests {
         cache_size: Option<u64>,
         virtiofsd_cache: &str,
         prepare_daemon: &dyn Fn(&TempDir, &str, &str) -> (std::process::Child, String),
+        hotplug: bool,
     ) {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
@@ -1803,26 +1804,35 @@ mod tests {
                 virtiofsd_cache,
             );
 
-            let mut child = GuestCommand::new(&guest)
+            let mut guest_command = GuestCommand::new(&guest);
+            guest_command
                 .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M,hotplug_size=2048M,file=/dev/shm"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&[
-                    "--fs",
-                    format!(
-                        "tag=myfs,sock={},num_queues=1,queue_size=1024,dax={}{}",
-                        virtiofsd_socket_path, dax_vmm_param, cache_size_vmm_param
-                    )
-                    .as_str(),
-                ])
                 .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
-                .args(&["--api-socket", &api_socket])
-                .spawn()
-                .unwrap();
+                .args(&["--api-socket", &api_socket]);
+
+            let fs_params = format!(
+                "tag=myfs,sock={},num_queues=1,queue_size=1024,dax={}{}",
+                virtiofsd_socket_path, dax_vmm_param, cache_size_vmm_param
+            );
+
+            if !hotplug {
+                guest_command.args(&["--fs", fs_params.as_str()]);
+            }
+
+            let mut child = guest_command.spawn().unwrap();
 
             thread::sleep(std::time::Duration::new(20, 0));
+
+            if hotplug {
+                // Add fs to the VM
+                aver!(tb, remote_command(&api_socket, "add-fs", Some(&fs_params),));
+
+                thread::sleep(std::time::Duration::new(10, 0));
+            }
 
             // Mount shared directory through virtio_fs filesystem
             let mount_cmd = format!(
@@ -1914,22 +1924,22 @@ mod tests {
 
     #[test]
     fn test_virtio_fs_dax_on_default_cache_size() {
-        test_virtio_fs(true, None, "none", &prepare_virtiofsd)
+        test_virtio_fs(true, None, "none", &prepare_virtiofsd, false)
     }
 
     #[test]
     fn test_virtio_fs_dax_on_cache_size_1_gib() {
-        test_virtio_fs(true, Some(0x4000_0000), "none", &prepare_virtiofsd)
+        test_virtio_fs(true, Some(0x4000_0000), "none", &prepare_virtiofsd, false)
     }
 
     #[test]
     fn test_virtio_fs_dax_off() {
-        test_virtio_fs(false, None, "none", &prepare_virtiofsd)
+        test_virtio_fs(false, None, "none", &prepare_virtiofsd, false)
     }
 
     #[test]
     fn test_virtio_fs_dax_on_default_cache_size_w_vhost_user_fs_daemon() {
-        test_virtio_fs(true, None, "none", &prepare_vhost_user_fs_daemon)
+        test_virtio_fs(true, None, "none", &prepare_vhost_user_fs_daemon, false)
     }
 
     #[test]
@@ -1939,12 +1949,33 @@ mod tests {
             Some(0x4000_0000),
             "none",
             &prepare_vhost_user_fs_daemon,
+            false,
         )
     }
 
     #[test]
     fn test_virtio_fs_dax_off_w_vhost_user_fs_daemon() {
-        test_virtio_fs(false, None, "none", &prepare_vhost_user_fs_daemon)
+        test_virtio_fs(false, None, "none", &prepare_vhost_user_fs_daemon, false)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_hotplug_dax_on() {
+        test_virtio_fs(true, None, "none", &prepare_virtiofsd, true)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_hotplug_dax_off() {
+        test_virtio_fs(false, None, "none", &prepare_virtiofsd, true)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_hotplug_dax_on_w_vhost_user_fs_daemon() {
+        test_virtio_fs(true, None, "none", &prepare_vhost_user_fs_daemon, true)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_hotplug_dax_off_w_vhost_user_fs_daemon() {
+        test_virtio_fs(false, None, "none", &prepare_vhost_user_fs_daemon, true)
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3668,7 +3699,10 @@ mod tests {
                 remote_command(
                     &api_socket,
                     "add-disk",
-                    Some(&format!("path={}", blk_file_path.to_str().unwrap()))
+                    Some(&format!(
+                        "path={},id=test0",
+                        blk_file_path.to_str().unwrap()
+                    ))
                 )
             );
 
@@ -3705,6 +3739,48 @@ mod tests {
                     .parse::<u32>()
                     .unwrap_or_default(),
                 1
+            );
+
+            aver!(
+                tb,
+                remote_command(&api_socket, "remove-device", Some("test0"))
+            );
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Check device has gone away
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+
+            guest.ssh_command("sudo reboot").unwrap_or_default();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 2);
+
+            // Check device still absent
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
             );
 
             let _ = child.kill();
@@ -3753,7 +3829,7 @@ mod tests {
                     &api_socket,
                     "add-pmem",
                     Some(&format!(
-                        "file={},size=128M",
+                        "file={},size=128M,id=test0",
                         pmem_temp_file.path().to_str().unwrap()
                     ))
                 )
@@ -3792,6 +3868,48 @@ mod tests {
                     .parse::<u32>()
                     .unwrap_or_default(),
                 1
+            );
+
+            aver!(
+                tb,
+                remote_command(&api_socket, "remove-device", Some("test0"))
+            );
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Check device has gone away
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep pmem0 | grep -c 128M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+
+            guest.ssh_command("sudo reboot").unwrap_or_default();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 2);
+
+            // Check still absent after reboot
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep pmem0 | grep -c 128M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
             );
 
             let _ = child.kill();

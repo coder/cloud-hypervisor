@@ -17,9 +17,7 @@ extern crate tempfile;
 extern crate url;
 extern crate vmm_sys_util;
 
-use crate::api::{
-    AddDiskResponse, ApiError, ApiRequest, ApiResponse, ApiResponsePayload, VmInfo, VmmPingResponse,
-};
+use crate::api::{AddDiskResponse, ApiError, ApiRequest, ApiResponse, ApiResponsePayload, VmInfo, VmmPingResponse};
 use crate::config::{
     DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig, VmConfig,
 };
